@@ -1,0 +1,173 @@
+---
+title: "W15: Augmenting Publicly Available Social Determinants of Health Datasets with Clinical Data to Power Multi-Institutional Clinical Research"
+output: html_notebook
+---
+
+This notebook details the steps necessary to connect clinical data derived from electronic health record systems in the OMOP Common Data Model to neighborhood-level social determinants of health (SDoH) data points. Using these neighborhood-level data points, we can examine the relationship between clinical outcomes (e.g. healthcare utilization, mortality, morbidity) and the built environment.
+
+It assumes several precursor steps. Most importantly, it assumes that you have access to an instance of the OMOP Common Data Model loaded into a Microsoft SQL Server instance. Localizing the code to differing SQL dialects should not be terribly challenging.
+
+For the purposes of this workshop, I have downloaded a publicly available data set (http://www.ltscomputingllc.com/downloads/) consisting of a 1000-person sample of the SynPUF (Synthetic Public Use File), released by CMS and transformed to the OMOP CDM (v5.2.2). Much thanks to LTS Computing LLC for making this file available. I have also migrated the data set to a local instance of Microsoft SQL Server running on my machine, using SQL Server Express, a free download from Microsoft (https://www.microsoft.com/en-us/sql-server/sql-server-downloads). 
+
+First, to connect to SQL Server and read our data in, we need to use the "RODBC" package to open up a connection to the database.
+
+```{r}
+require(RODBC)
+require(tidyverse)
+```
+
+Now that we have RODBC installed, we can open a connection. In this case, we'll be connecting to the local machine, so I set up a DSN in Windows to make the connection simpler. Obviously, you can subsitute here the given parameters required to connect to an OMOP instance if you have one available at your institution, either by configuring a DSN or, if you don't want to set up a DSN, by using the "odbcDriverConnect" function, which lets you pass the parameters directly. For more details, see https://rdrr.io/cran/RODBC/man/odbcConnect.html
+
+```{r}
+con = odbcConnect("localhost")
+```
+
+We can test the open connection by querying some of the SQL tables in the OMOP instance:
+
+```{r}
+test_person = sqlQuery(con,"select top 100 * from omop_synthetic.dbo.person")
+head(test_person)
+```
+
+Looks like it worked. Let's also try joining a table to another to table to make sure that works through this interface:
+
+```{r}
+test_join = sqlQuery(con,"select top 1000 person_id, condition_start_date, concept_name as condition_name
+                     from omop_synthetic.dbo.condition_occurrence co
+                     join omop_synthetic.dbo.concept c on co.condition_concept_id = c.concept_id
+                     ")
+head(test_join)
+```
+
+
+Great - looks like it worked. Now we can start building a flat file out of the OMOP data. At this point, we're really just working with OMOP data rather than integrating SDoH, but that will come. As an example of what we can do with the data, we'll be ultimately pursuing the following question:
+
+*Do patients with diabetes experience more diabetes-related hospital visits if they live in vulnerable neighborhoods?*
+
+First, we can characterize some of the most common conditions in this synthetic data:
+
+```{r}
+dx = sqlQuery(con,"	select concept_name, count(1)
+	from OMOP_SYNTHETIC.dbo.CONDITION_OCCURRENCE co
+	join OMOP_SYNTHETIC.dbo.concept c on c.concept_id = co.condition_concept_id
+	group by concept_name
+	order by count(1) desc")
+dx
+```
+
+Looks like the most common diagnoses here are what we'd expect to see in a population. These are all clinical variables we could easily convert to dichotomous values to incorporate into a regression. OMOP has plenty of data we could also use as outcomes, including visit data. Let's see what kind of visits people have documented in the data to determine whether there's enough data to use visit frequency as an outcome.
+```{r}
+visits = sqlQuery(con,"		select concept_name, visit_concept_id, count(1)
+	from OMOP_SYNTHETIC.dbo.visit_occurrence vo
+	join OMOP_SYNTHETIC.dbo.concept c on c.concept_id = vo.visit_concept_id
+	group by concept_name, visit_concept_id
+	order by count(1) desc")
+visits
+```
+Looks like the majority of visits in this data set weren't mapped to one of the OMOP standard concepts. No matter - there are still enough inpatient visits for us to use that as an outcome in this proof-of-concept analysis. Just to be sure, let's determine whether there are inpatient visits *associated with a diagnosis of diabetes* so we can further refine our outcome measure to include only diabetes-related hospitalizations.
+```{r}
+inpt_dx = sqlQuery(con,"	select concept_name, count(1)
+	from OMOP_SYNTHETIC.dbo.CONDITION_OCCURRENCE co
+	join OMOP_SYNTHETIC.dbo.concept c on c.concept_id = co.condition_concept_id
+	join OMOP_SYNTHETIC.dbo.visit_occurrence vo on vo.visit_occurrence_id = co.visit_occurrence_id
+													and vo.visit_concept_id = 9201
+	group by concept_name
+	order by count(1) desc")
+inpt_dx
+```
+Looks like we're good. Now, let's think about the kind of flat file we might want in order to create a regression. I'm using regression as an example here, but there any number of other predictive models that could easily take the same input - random forest, naive Bayesian classifiers, etc. Remember that the ultimate goal is to assess whether there's a relationship between neighborhood-level social deprivation and hospital vists in patients with diabetes - but we might want to bring in some other variables to control for potential confounds. In this case, I'll bring in race and ethnicity. These are stored as categorical values in the OMOP PERSON table, so we'll need to recode them as dummy dichotomous variables so we can pass them on to a linear model in R.
+```{r}
+demog_coded = sqlQuery(con,"select person_id, 
+case when race.concept_name = 'White' then 1 else 0 end as white_yn,
+case when race.concept_name = 'Black or African American' then 1 else 0 end as aa_yn,
+case when race.concept_name = 'No matching concept' then 1 else 0 end as unk_yn,
+case when eth.concept_name = 'Not Hispanic or Latino' then 1 else 0 end as nonhisp_yn,
+case when eth.concept_name = 'Hispanic or Latino' then 1 else 0 end as hisp_yn
+from OMOP_SYNTHETIC.dbo.person p
+join OMOP_SYNTHETIC.dbo.concept race on p.race_concept_id = race.CONCEPT_ID
+join OMOP_SYNTHETIC.dbo.concept eth on p.ethnicity_concept_id = eth.CONCEPT_ID")
+head(demog_coded)
+table(demog_coded$white_yn,demog_coded$nonhisp_yn)
+```
+Now we can restrict to only patients with diabetes and add the outcome variable - the count of hospitalizations. Remember that we want to include only hospitalizations associated with a diagnosis of diabetes.
+```{r}
+clinical_only = sqlQuery(con,"select p.person_id, 
+case when race.concept_name = 'White' then 1 else 0 end as white_yn,
+case when race.concept_name = 'Black or African American' then 1 else 0 end as aa_yn,
+case when race.concept_name = 'No matching concept' then 1 else 0 end as unk_yn,
+case when eth.concept_name = 'Not Hispanic or Latino' then 1 else 0 end as nonhisp_yn,
+case when eth.concept_name = 'Hispanic or Latino' then 1 else 0 end as hisp_yn,
+count(distinct dm_hosp.visit_occurrence_id) as count_hospitalizations
+from OMOP_SYNTHETIC.dbo.person p
+join OMOP_SYNTHETIC.dbo.concept race on p.race_concept_id = race.CONCEPT_ID
+join OMOP_SYNTHETIC.dbo.concept eth on p.ethnicity_concept_id = eth.CONCEPT_ID
+left join (select vo.person_id, vo.visit_occurrence_id from OMOP_SYNTHETIC.dbo.visit_occurrence vo 
+								join OMOP_SYNTHETIC.dbo.CONDITION_OCCURRENCE co
+									on co.visit_occurrence_id = vo.visit_occurrence_id
+								join OMOP_SYNTHETIC.dbo.concept c
+									on c.CONCEPT_ID = co.condition_concept_id
+								where c.concept_name = 'Type 2 diabetes mellitus'
+) dm_hosp
+on dm_hosp.person_id = p.person_id 
+group by p.person_id, race.concept_name, eth.CONCEPT_NAME
+		")
+head(clinical_only)
+```
+
+Now we have a table we can use to predict an outcome! Again, so far, all we've done here is more about OMOP than it is about integrating geographic predictors. Everything in this table comes only from the stock OMOP tables. But what happens when we start to integrate the geographic data we have through the VACCINE technique?
+
+```{r}
+location = sqlQuery(con,"select * from omop_synthetic.dbo.location_2")
+head(location)
+```
+
+As you can see here, we've made one slight addition to the stock OMOP specification for this table - we've added a column called FIPS. This is the census-tract level FIPS code indicating the specific geographic unit to which the location belongs. In our case, we have identified this by geocoding patient addresses directly from the source EHR systems using an API provided by the FCC (https://geocoding.geo.census.gov/). Previous work presented at AMIA has illustrated alternate techniques for client-side geocoding, such as DeGAUSS (see Brokamp C, Wolfe C, Lingren T, Harley J, Ryan P. Decentralized and reproducible geocoding and characterization of community and environmental exposures for multisite studies. J Am Med Inform Assoc. 2018;25(3):309-314. doi:10.1093/jamia/ocx128), https://www.ncbi.nlm.nih.gov/pmc/articles/PMC7378876/ https://github.com/degauss-org/DeGAUSS
+
+Regardless of how you've obtained them, once you have FIPS codes for patient locations, you're only a join or two away from incorporating neighborhood-level SDoH data into your model. In addition to the stock OMOP tables, we've also uploaded some of the data demonstrated in the first session of the workplace into the same SQL Server database:
+
+```{r}
+census = sqlQuery(con,"		select * from OMOP_SYNTHETIC.dbo.censusTract")
+head(census)
+```
+
+We could merge this data in through R on the basis of the FIPS code, jumping from the LOCATION_ID in the PERSON table to the Census_Tract column in the censusTract table via the LOCATION_2 table. Or we can do the join in SQL - either way. I have illustrated the SQL technique below.
+
+```{r}
+merged_final = sqlQuery(con,"select p.person_id, 
+case when race.concept_name = 'White' then 1 else 0 end as white_yn,
+case when race.concept_name = 'Black or African American' then 1 else 0 end as aa_yn,
+case when race.concept_name = 'No matching concept' then 1 else 0 end as unk_yn,
+case when eth.concept_name = 'Not Hispanic or Latino' then 1 else 0 end as nonhisp_yn,
+case when eth.concept_name = 'Hispanic or Latino' then 1 else 0 end as hisp_yn,
+count(distinct dm_hosp.visit_occurrence_id) as count_hospitalizations,
+census.unemployed,
+census.belowPoverty,
+census.no_school_to_12_grade_no_diploma,
+census.treeCount
+from OMOP_SYNTHETIC.dbo.person p
+join OMOP_SYNTHETIC.dbo.concept race on p.race_concept_id = race.CONCEPT_ID
+join OMOP_SYNTHETIC.dbo.concept eth on p.ethnicity_concept_id = eth.CONCEPT_ID
+left join (select vo.person_id, vo.visit_occurrence_id from OMOP_SYNTHETIC.dbo.visit_occurrence vo 
+								join OMOP_SYNTHETIC.dbo.CONDITION_OCCURRENCE co
+									on co.visit_occurrence_id = vo.visit_occurrence_id
+								join OMOP_SYNTHETIC.dbo.concept c
+									on c.CONCEPT_ID = co.condition_concept_id
+								where c.concept_name = 'Type 2 diabetes mellitus'
+) dm_hosp
+on dm_hosp.person_id = p.person_id 
+join OMOP_SYNTHETIC.dbo.location_2 l on l.location_id = p.location_id
+join OMOP_SYNTHETIC.dbo.censusTract census on census.Census_Tract = l.fips
+group by p.person_id, race.concept_name, eth.CONCEPT_NAME,census.unemployed,
+census.belowPoverty,
+census.no_school_to_12_grade_no_diploma,
+census.treeCount")
+head(merged_final)
+```
+
+Now we have our final data set! Note that it includes a number of variables derived from OMOP, as well as a number of variables derived from the neighborhood-level SDoH data set aggregated in the first session. We can easily bring in other parameters (e.g. comorbidities, drug exposures, lab values) as well as other outcomes (like death) into the model by modifying the SQL queries above to pull them from the OMOP instance. Likewise, by modifying the query in the cell above, we can easily bring in other SDoH predictors. Either way, it's now possible to build a predictive model that includes both clinical data from the OMOP CDM and neighborhood-level SDoH!
+```{r}
+model = lm(count_hospitalizations ~ white_yn + aa_yn + unk_yn + nonhisp_yn + hisp_yn + belowPoverty, data = merged_final)
+anova(model)
+```
+
+Obviously the results here are meaningless, given the synthetic nature of the data and the random assignment of addresses.
